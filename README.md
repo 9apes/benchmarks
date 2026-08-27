@@ -11,14 +11,22 @@ workflows, and you will get your own timings on your own account.
 
 One job definition, two `runs-on` values:
 
-| arm | label |
-|---|---|
-| GitHub-hosted | `ubuntu-latest` |
-| 9apes | `9apes-2vcpu-ubuntu-2404` |
+| project | GitHub-hosted | 9apes | size |
+|---|---|---|---|
+| duckdb, folly, peerdb | `ubuntu-latest` | `9apes-4vcpu-ubuntu-2404` | 4 vCPU |
+| xls | `ubuntu-8-core` | `9apes-8vcpu-ubuntu-2404` | 8 vCPU |
 
-`ubuntu-latest` is a 2 vCPU machine, so it is compared against the **2 vCPU** 9apes
-label rather than the 4 vCPU default. Comparing against a larger machine would
-measure machine size instead of machine speed.
+Both arms of a row are the same size, which is what makes that row a fair
+comparison. Rows do not all use the same size as each other: xls runs at 8 vCPU
+because at 2 it takes over five hours, which leaves no headroom under GitHub's
+360-minute job cap.
+
+A detail worth knowing if you fork this: **`ubuntu-latest` is not a fixed size.**
+GitHub gives it 2 vCPU on a private repository and 4 vCPU on a public one. This
+repository is public, so it is 4 vCPU and pairs with the 4 vCPU 9apes label. Every
+job asserts that the machine it got matches the size its row declares and fails if
+it does not, because a benchmark claiming both arms are the same size should check
+that rather than assume it.
 
 Nothing else differs between the arms. Same workload, same commit, same steps.
 
@@ -37,16 +45,16 @@ log, and the published figures are parsed out of those logs rather than transcri
 by hand:
 
 ```
-OSS_RESULT {"arm":"nineapes","project":"duckdb","repeat":"1","ms":657482,"nproc":2}
+OSS_RESULT {"arm":"nineapes","project":"duckdb","repeat":"1","ms":657482,"nproc":4,"runner":"9apes-4vcpu-ubuntu-2404"}
 ```
 
 Every job also prints a banner recording vCPU count, memory, kernel, and the type
-and free space of `/` and `/tmp` — enough to tell whether two runs are actually
-comparable.
+and free space of `/` and `/tmp`, which is enough to tell whether two runs are
+actually comparable.
 
 ## The workloads
 
-### `bench-oss.yml` — real open-source builds
+### `bench-oss.yml`: real open-source builds
 
 Each project is checked out at a pinned commit and built with the command its own
 upstream CI or documentation uses. These are the projects' real builds, not
@@ -54,23 +62,14 @@ workloads invented for a marketing page.
 
 | project | build | why it is here |
 |---|---|---|
-| [duckdb/duckdb](https://github.com/duckdb/duckdb) `v1.5.5` | `GEN=ninja make release` | C++ with no external dependencies at all — nothing the two host images can disagree about |
+| [duckdb/duckdb](https://github.com/duckdb/duckdb) `v1.5.5` | `GEN=ninja make release` | C++ with no external dependencies at all, so nothing the two host images can disagree about |
 | [facebook/folly](https://github.com/facebook/folly) `23b22c1a` | `getdeps.py build --no-tests` | Heavy C++ with a deep native dependency tree |
 | [PeerDB-io/peerdb](https://github.com/PeerDB-io/peerdb) `76442499` | `cargo build --release` + `go build ./...` | Mixed Rust and Go in one build |
 | [google/xls](https://github.com/google/xls) `62f2007c` | `bazel build --config=ci -c opt` | Bazel, and by far the longest build here |
 
-Two absences are deliberate:
+All four are part of the published set.
 
-**nasa/astrobee** cannot be reproduced honestly. Its `INSTALL.md` states Ubuntu 20.04
-is the only supported platform (ROS 1 Noetic, EOL May 2025), GitHub has retired
-`ubuntu-20.04` runners, and upstream builds it inside Docker — which would time
-container construction rather than the machine.
-
-**xls** is defined here and can be dispatched, but is not part of the published set.
-It takes over five hours on a 2 vCPU machine, which makes three repetitions per arm
-impractical.
-
-### `bench-compare.yml` — dependency install and build
+### `bench-compare.yml`: dependency install and build
 
 Three small, self-contained projects in this repository, exercising the pattern most
 CI jobs actually spend their time on:
@@ -83,16 +82,17 @@ CI jobs actually spend their time on:
 
 ## Reproducing this
 
-You need a fork and, for the 9apes arm, a runner registered under the
-`9apes-2vcpu-ubuntu-2404` label. Without one, delete the `nineapes` entry from the
-matrix and you will still get the GitHub-hosted baseline.
+You need a fork and, for the 9apes arm, runners registered under the
+`9apes-4vcpu-ubuntu-2404` and `9apes-8vcpu-ubuntu-2404` labels. Without them, delete
+the `nineapes` rows from the matrix and you will still get the GitHub-hosted
+baseline.
 
 ```bash
 gh workflow run bench-oss.yml -f repeat=1 -f only=duckdb
 ```
 
 `only` limits the run to a single project; leave it blank for the whole matrix.
-`repeat` labels the repetition — run it once per value and take the median, which is
+`repeat` labels the repetition. Run it once per value and take the median, which is
 what the published figures report.
 
 ```bash
@@ -105,8 +105,8 @@ request execute code on a self-hosted runner.
 
 ## What this does not tell you
 
-These are cold, single-job, 2 vCPU builds of four open-source projects and three
-synthetic ones. They say nothing about how either platform behaves with warm caches,
+These are cold, single-job builds of four open-source projects and three synthetic
+ones. They say nothing about how either platform behaves with warm caches,
 with large matrices running in parallel, under queue contention, or on your code.
 The reason the workflows are here rather than a results table alone is that your
 build is the one that matters, and you can run it yourself.
