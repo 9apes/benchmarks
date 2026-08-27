@@ -2,10 +2,12 @@ name: Bench compare (GitHub-hosted vs 9apes)
 
 # Head-to-head timings for https://9apes.com/benchmarks/.
 #
-# The only difference between the two arms is `runs-on`. Runner sizes are
-# matched: `ubuntu-latest` is 2 vCPU, so it is compared against the 2 vCPU
-# 9apes label rather than the 4 vCPU default, or the comparison would be
-# measuring machine size instead of machine speed.
+# Both arms run at 4 vCPU. `ubuntu-latest` is 2 vCPU on a private repository
+# and 4 vCPU on a public one; this repository is public, so it is paired with
+# the 4 vCPU 9apes label. The size is asserted at run time rather than assumed.
+#
+# The only difference between the two arms is `runs-on`. Sizes are matched, or
+# the comparison would be measuring machine size instead of machine speed.
 #
 # All caching is disabled. A cache hit measures the cache, not the runner, and
 # the two platforms cache differently. Every run here is cold on purpose.
@@ -30,13 +32,13 @@ permissions:
 
 jobs:
   bench:
-    name: "${{ matrix.workload }} on ${{ matrix.runner }} (run ${{ inputs.repeat }})"
-    runs-on: ${{ matrix.runner == 'github' && 'ubuntu-latest' || '9apes-2vcpu-ubuntu-2404' }}
+    name: "${{ matrix.workload }} on ${{ matrix.arm }} (run ${{ inputs.repeat }})"
+    runs-on: ${{ matrix.arm == 'github' && 'ubuntu-latest' || '9apes-4vcpu-ubuntu-2404' }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        runner: [github, nineapes]
+        arm: [github, nineapes]
         workload: [pnpm, go, maven]
     defaults:
       run:
@@ -45,7 +47,7 @@ jobs:
     steps:
       - name: Record machine
         run: |
-          echo "runner arm : ${{ matrix.runner }}"
+          echo "runner arm : ${{ matrix.arm }}"
           echo "workload   : ${{ matrix.workload }}"
           echo "nproc      : $(nproc)"
           echo "mem total  : $(free -g 2>/dev/null | awk '/^Mem:/{print $2" GB"}' || echo unknown)"
@@ -55,6 +57,18 @@ jobs:
           # space on a machine whose root disk looks healthy.
           echo "fs /       : $(df -h --output=fstype,avail / | tail -1)"
           echo "fs /tmp    : $(df -h --output=fstype,avail /tmp | tail -1)"
+
+      - name: Check the machine is the size this row expects
+        run: |
+          set -euo pipefail
+          got="$(nproc)"
+          if [ "$got" != "4" ]; then
+            echo "::error::Got ${got} vCPU, expected 4. Both arms must be the same size."
+            echo "::error::ubuntu-latest is 2 vCPU on a private repo and 4 vCPU on a public one;"
+            echo "::error::if this repo's visibility changed, re-pair the 9apes label to match."
+            exit 1
+          fi
+          echo "size-matched at ${got} vCPU"
 
       - name: Smoke test short-circuit
         if: ${{ inputs.smoke }}
@@ -135,9 +149,9 @@ jobs:
           # BENCH_RESULT is machine-readable on purpose: the published figures
           # are parsed straight out of these logs rather than transcribed by
           # hand. Keep the shape stable.
-          echo "BENCH_RESULT {\"arm\":\"${{ matrix.runner }}\",\"workload\":\"${{ matrix.workload }}\",\"repeat\":\"${{ inputs.repeat }}\",\"ms\":${WORKLOAD_MS},\"nproc\":$(nproc),\"sha\":\"${GITHUB_SHA}\"}"
+          echo "BENCH_RESULT {\"arm\":\"${{ matrix.arm }}\",\"workload\":\"${{ matrix.workload }}\",\"repeat\":\"${{ inputs.repeat }}\",\"ms\":${WORKLOAD_MS},\"nproc\":$(nproc),\"runner\":\"${{ matrix.arm == 'github' && 'ubuntu-latest' || '9apes-4vcpu-ubuntu-2404' }}\",\"sha\":\"${GITHUB_SHA}\"}"
           {
-            echo "### ${{ matrix.workload }} on ${{ matrix.runner }} (run ${{ inputs.repeat }})"
+            echo "### ${{ matrix.workload }} on ${{ matrix.arm }} (run ${{ inputs.repeat }})"
             echo ""
             echo "| metric | value |"
             echo "|---|---:|"
