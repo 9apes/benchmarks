@@ -1,0 +1,256 @@
+name: Bench OSS (GitHub-hosted vs 9apes)
+
+# Reproduces the compile-heavy benchmarks published on https://9apes.com/.
+#
+# Each project is checked out at a pinned commit and built with the command its
+# own upstream CI uses, so the workload is the project's real build rather than
+# something invented for a marketing page. The only difference between the two
+# arms is `runs-on`.
+#
+# Sizes are matched: `ubuntu-latest` is 2 vCPU, compared against the 2 vCPU
+# 9apes label, not the 4 vCPU default.
+#
+# Toolchain installation, system packages and code generation each get their own
+# step, outside the timer. Only compilation is measured, and both arms run
+# identical preparation.
+#
+# nasa/astrobee is deliberately absent. Its INSTALL.md states Ubuntu 20.04 is
+# the only supported platform (ROS1 Noetic, EOL May 2025) and GitHub has retired
+# ubuntu-20.04 runners. Upstream builds it inside Docker, which would time
+# container construction rather than the machine, so there is no honest
+# like-for-like to run here.
+#
+# duckdb takes its place. It is pinned to the v1.5.5 release rather than a bare
+# commit, and it builds with no external dependencies at all -- only cmake,
+# ninja and a compiler -- which is exactly what a benchmark spanning two
+# different Ubuntu images wants: nothing the two hosts can disagree about.
+
+on:
+  workflow_dispatch:
+    inputs:
+      repeat:
+        description: "Which repetition this is."
+        required: true
+        default: "1"
+        type: choice
+        options: ["1", "2", "3"]
+      only:
+        description: "Limit to one project (blank = all)."
+        required: false
+        default: ""
+        type: choice
+        options: ["", "xls", "folly", "peerdb", "duckdb"]
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: "${{ matrix.project }} on ${{ matrix.arm }} (run ${{ inputs.repeat }})"
+    runs-on: ${{ matrix.arm == 'github' && 'ubuntu-latest' || '9apes-2vcpu-ubuntu-2404' }}
+    # GitHub caps a job at 360 minutes; xls took ~3h26m on 2 vCPU historically.
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        arm: [github, nineapes]
+        project: [xls, folly, peerdb, duckdb]
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      XLS_SHA: 62f2007c932d4754cafdd4f95fad844b501fdfc8
+      FOLLY_SHA: 23b22c1a31f0d0777a2933aad093508dd42be8f9
+      PEERDB_SHA: 76442499812d43646cbb8c3c3f78bfe5260a13ff
+      DUCKDB_SHA: d8cdaa33fda8df955cc76ef58a280f68f4cd43fa
+      # Resolved once so every `if:` below reads the same way.
+      RUN_XLS: ${{ matrix.project == 'xls' && (inputs.only == '' || inputs.only == 'xls') }}
+      RUN_FOLLY: ${{ matrix.project == 'folly' && (inputs.only == '' || inputs.only == 'folly') }}
+      RUN_PEERDB: ${{ matrix.project == 'peerdb' && (inputs.only == '' || inputs.only == 'peerdb') }}
+      RUN_DUCKDB: ${{ matrix.project == 'duckdb' && (inputs.only == '' || inputs.only == 'duckdb') }}
+
+    steps:
+      - name: Record machine
+        run: |
+          echo "arm      : ${{ matrix.arm }}"
+          echo "project  : ${{ matrix.project }}"
+          echo "nproc    : $(nproc)"
+          echo "mem      : $(free -g | awk '/^Mem:/{print $2" GB"}')"
+          echo "kernel   : $(uname -r)"
+          echo "disk /   : $(df -BG --output=avail / | tail -1)"
+          echo "disk /tmp: $(df -BG --output=avail /tmp | tail -1)"
+
+      # ---------------- google/xls (Bazel) ----------------
+      - name: Checkout xls
+        if: ${{ env.RUN_XLS == 'true' }}
+        uses: actions/checkout@v4
+        with:
+          repository: google/xls
+          ref: 62f2007c932d4754cafdd4f95fad844b501fdfc8
+          path: work
+
+      - name: Prepare xls toolchain
+        if: ${{ env.RUN_XLS == 'true' }}
+        working-directory: work
+        run: |
+          set -euo pipefail
+          # Same apt list as google/xls continuous-integration.yml.
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq python3-dev python-is-python3 build-essential \
+            liblapack-dev libblas-dev gfortran libtinfo6 >/dev/null
+          # Install bazelisk rather than trusting the runner image to ship
+          # bazel, so both arms resolve the identical version from
+          # .bazelversion (8.7.0 at this commit).
+          sudo curl -fsSL -o /usr/local/bin/bazel \
+            https://github.com/bazelbuild/bazelisk/releases/download/v1.29.0/bazelisk-linux-amd64
+          sudo chmod +x /usr/local/bin/bazel
+          # Fetches the pinned bazel here, before the timer starts.
+          bazel --version
+
+      - name: Build xls
+        if: ${{ env.RUN_XLS == 'true' }}
+        working-directory: work
+        run: |
+          set -euo pipefail
+          START=$(date +%s%3N)
+          # Same targets as google/xls continuous-integration.yml.
+          bazel build --config=ci -c opt --noshow_progress -- \
+            //xls/dslx:interpreter_main \
+            //xls/dslx/ir_convert:ir_converter_main \
+            //xls/tools:opt_main \
+            //xls/tools:codegen_main
+          echo "WORKLOAD_MS=$(( $(date +%s%3N) - START ))" >> "$GITHUB_ENV"
+
+      # ---------------- facebook/folly (getdeps) ----------------
+      - name: Checkout folly
+        if: ${{ env.RUN_FOLLY == 'true' }}
+        uses: actions/checkout@v4
+        with:
+          repository: facebook/folly
+          ref: 23b22c1a31f0d0777a2933aad093508dd42be8f9
+          path: work
+
+      - name: Prepare folly system deps
+        if: ${{ env.RUN_FOLLY == 'true' }}
+        working-directory: work
+        run: |
+          set -euo pipefail
+          # getdeps scratches in /tmp by default. On the 9apes image /tmp is a
+          # separate, much smaller filesystem than /, and folly's dependency
+          # tree fills it. Both arms get the same explicit path on the main
+          # disk, so neither is advantaged.
+          mkdir -p "$HOME/getdeps"
+          sudo python3 build/fbcode_builder/getdeps.py --allow-system-packages \
+            --scratch-path "$HOME/getdeps" \
+            install-system-deps --recursive folly
+
+      - name: Build folly
+        if: ${{ env.RUN_FOLLY == 'true' }}
+        working-directory: work
+        run: |
+          set -euo pipefail
+          START=$(date +%s%3N)
+          python3 build/fbcode_builder/getdeps.py --allow-system-packages \
+            --scratch-path "$HOME/getdeps" \
+            build --no-tests --src-dir=. folly
+          echo "WORKLOAD_MS=$(( $(date +%s%3N) - START ))" >> "$GITHUB_ENV"
+
+      # ---------------- PeerDB (Rust + Go) ----------------
+      - name: Checkout peerdb
+        if: ${{ env.RUN_PEERDB == 'true' }}
+        uses: actions/checkout@v4
+        with:
+          repository: PeerDB-io/peerdb
+          ref: 76442499812d43646cbb8c3c3f78bfe5260a13ff
+          path: work
+
+      - uses: actions/setup-go@v5
+        if: ${{ env.RUN_PEERDB == 'true' }}
+        with:
+          go-version-file: work/flow/go.mod
+          cache: false
+
+      # nexus/pt/src/gen and flow/generated are gitignored: PeerDB compiles its
+      # .proto files into Rust and Go sources at build time with buf. Without
+      # this the build dies on `couldn't read pt/src/./gen/...`. PeerDB's own CI
+      # does the same in .github/actions/genprotos.
+      - name: Install buf
+        if: ${{ env.RUN_PEERDB == 'true' }}
+        uses: bufbuild/buf-action@8c6a16e16f12ba20b6470afa9c2ba9b5ba8c97c3 # v1.5.0
+        with:
+          setup_only: true
+          github_token: ${{ github.token }}
+
+      - name: Prepare peerdb protos and system deps
+        if: ${{ env.RUN_PEERDB == 'true' }}
+        working-directory: work
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          # libgeos-dev is required by flow/: github.com/twpayne/go-geos resolves
+          # geos through pkg-config. PeerDB installs it in golang-lint.yml; the
+          # rest of the list is theirs from ci.yml.
+          sudo apt-get install -y -qq libgeos-dev libssl-dev pkg-config \
+            build-essential protobuf-compiler >/dev/null
+          # Codegen is network-bound (buf pulls remote plugins), so it runs here
+          # rather than inside the measured window.
+          ./generate-protos.sh
+
+      - name: Build peerdb
+        if: ${{ env.RUN_PEERDB == 'true' }}
+        working-directory: work
+        run: |
+          set -euo pipefail
+          START=$(date +%s%3N)
+          (cd nexus && cargo build --release)
+          (cd flow && go build ./...)
+          echo "WORKLOAD_MS=$(( $(date +%s%3N) - START ))" >> "$GITHUB_ENV"
+
+      # ---------------- duckdb/duckdb (CMake + Ninja) ----------------
+      - name: Checkout duckdb
+        if: ${{ env.RUN_DUCKDB == 'true' }}
+        uses: actions/checkout@v4
+        with:
+          repository: duckdb/duckdb
+          ref: d8cdaa33fda8df955cc76ef58a280f68f4cd43fa
+          path: work
+
+      - name: Prepare duckdb toolchain
+        if: ${{ env.RUN_DUCKDB == 'true' }}
+        run: |
+          set -euo pipefail
+          # cmake ships on both images; ninja does not, and upstream CI sets
+          # GEN=ninja, so install it rather than silently falling back to make.
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ninja-build build-essential >/dev/null
+          cmake --version | head -1
+          ninja --version
+
+      - name: Build duckdb
+        if: ${{ env.RUN_DUCKDB == 'true' }}
+        working-directory: work
+        env:
+          GEN: ninja
+        run: |
+          set -euo pipefail
+          START=$(date +%s%3N)
+          # duckdb's documented build, and the target its own CI builds.
+          # No vcpkg step: EXTENSION_CONFIG_STEP is empty unless extensions are
+          # configured, so this compiles the engine and nothing off the network.
+          make release
+          echo "WORKLOAD_MS=$(( $(date +%s%3N) - START ))" >> "$GITHUB_ENV"
+
+      # ---------------- report ----------------
+      - name: Emit result
+        if: ${{ always() && env.WORKLOAD_MS != '' }}
+        run: |
+          echo "OSS_RESULT {\"arm\":\"${{ matrix.arm }}\",\"project\":\"${{ matrix.project }}\",\"repeat\":\"${{ inputs.repeat }}\",\"ms\":${WORKLOAD_MS},\"nproc\":$(nproc)}"
+          {
+            echo "### ${{ matrix.project }} on ${{ matrix.arm }} (run ${{ inputs.repeat }})"
+            echo ""
+            echo "| metric | value |"
+            echo "|---|---:|"
+            echo "| build wall-clock | ${WORKLOAD_MS} ms |"
+            echo "| vCPU | $(nproc) |"
+          } >> "$GITHUB_STEP_SUMMARY"

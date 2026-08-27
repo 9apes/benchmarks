@@ -1,0 +1,147 @@
+name: Bench compare (GitHub-hosted vs 9apes)
+
+# Head-to-head timings for https://9apes.com/benchmarks/.
+#
+# The only difference between the two arms is `runs-on`. Runner sizes are
+# matched: `ubuntu-latest` is 2 vCPU, so it is compared against the 2 vCPU
+# 9apes label rather than the 4 vCPU default, or the comparison would be
+# measuring machine size instead of machine speed.
+#
+# All caching is disabled. A cache hit measures the cache, not the runner, and
+# the two platforms cache differently. Every run here is cold on purpose.
+
+on:
+  workflow_dispatch:
+    inputs:
+      repeat:
+        description: "Which repetition this is (1, 2 or 3). Run the workflow once per value."
+        required: true
+        default: "1"
+        type: choice
+        options: ["1", "2", "3"]
+      smoke:
+        description: "Smoke test only: confirm both labels pick up work, skip the workloads."
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: "${{ matrix.workload }} on ${{ matrix.runner }} (run ${{ inputs.repeat }})"
+    runs-on: ${{ matrix.runner == 'github' && 'ubuntu-latest' || '9apes-2vcpu-ubuntu-2404' }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [github, nineapes]
+        workload: [pnpm, go, maven]
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Record machine
+        run: |
+          echo "runner arm : ${{ matrix.runner }}"
+          echo "workload   : ${{ matrix.workload }}"
+          echo "nproc      : $(nproc)"
+          echo "mem total  : $(free -g 2>/dev/null | awk '/^Mem:/{print $2" GB"}' || echo unknown)"
+          echo "kernel     : $(uname -r)"
+          # /tmp is reported separately because it is not always the same
+          # filesystem as /, and a build that scratches there can run out of
+          # space on a machine whose root disk looks healthy.
+          echo "fs /       : $(df -h --output=fstype,avail / | tail -1)"
+          echo "fs /tmp    : $(df -h --output=fstype,avail /tmp | tail -1)"
+
+      - name: Smoke test short-circuit
+        if: ${{ inputs.smoke }}
+        run: echo "Smoke test only — both labels picked up work. Skipping workload."
+
+      - uses: actions/checkout@v4
+        if: ${{ !inputs.smoke }}
+
+      # ---------------- pnpm ----------------
+      - uses: pnpm/action-setup@v4
+        if: ${{ !inputs.smoke && matrix.workload == 'pnpm' }}
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        if: ${{ !inputs.smoke && matrix.workload == 'pnpm' }}
+        with:
+          node-version: 22
+          # No cache: this benchmark measures the machine, not cache warmth.
+
+      - name: "pnpm install + build"
+        if: ${{ !inputs.smoke && matrix.workload == 'pnpm' }}
+        working-directory: pnpm-bench
+        run: |
+          source ../scripts/bench-time.sh
+          T=$(now_ms)
+          pnpm install --frozen-lockfile
+          INSTALL=$(dur_ms "$T")
+          B=$(now_ms)
+          pnpm run build
+          BUILD=$(dur_ms "$B")
+          echo "WORKLOAD_MS=$(( INSTALL + BUILD ))" >> "$GITHUB_ENV"
+          echo "DETAIL=install ${INSTALL}ms, build ${BUILD}ms" >> "$GITHUB_ENV"
+
+      # ---------------- go ----------------
+      - uses: actions/setup-go@v5
+        if: ${{ !inputs.smoke && matrix.workload == 'go' }}
+        with:
+          go-version: "1.23"
+          cache: false
+
+      - name: "go download + build"
+        if: ${{ !inputs.smoke && matrix.workload == 'go' }}
+        working-directory: go-bench
+        run: |
+          source ../scripts/bench-time.sh
+          T=$(now_ms)
+          go mod download
+          DL=$(dur_ms "$T")
+          B=$(now_ms)
+          go build -a -trimpath -o /tmp/cache-bench-go ./...
+          BUILD=$(dur_ms "$B")
+          echo "WORKLOAD_MS=$(( DL + BUILD ))" >> "$GITHUB_ENV"
+          echo "DETAIL=download ${DL}ms, build ${BUILD}ms" >> "$GITHUB_ENV"
+
+      # ---------------- maven ----------------
+      - uses: actions/setup-java@v4
+        if: ${{ !inputs.smoke && matrix.workload == 'maven' }}
+        with:
+          distribution: temurin
+          java-version: "21"
+          # No cache input: setup-java defaults to no dependency caching.
+
+      - name: "maven package"
+        if: ${{ !inputs.smoke && matrix.workload == 'maven' }}
+        working-directory: maven-bench
+        run: |
+          source ../scripts/bench-time.sh
+          T=$(now_ms)
+          mvn -B -q package -DskipTests
+          echo "WORKLOAD_MS=$(dur_ms "$T")" >> "$GITHUB_ENV"
+          echo "DETAIL=mvn package" >> "$GITHUB_ENV"
+
+      # ---------------- report ----------------
+      - name: Emit result
+        if: ${{ !inputs.smoke }}
+        run: |
+          # BENCH_RESULT is machine-readable on purpose: the published figures
+          # are parsed straight out of these logs rather than transcribed by
+          # hand. Keep the shape stable.
+          echo "BENCH_RESULT {\"arm\":\"${{ matrix.runner }}\",\"workload\":\"${{ matrix.workload }}\",\"repeat\":\"${{ inputs.repeat }}\",\"ms\":${WORKLOAD_MS},\"nproc\":$(nproc),\"sha\":\"${GITHUB_SHA}\"}"
+          {
+            echo "### ${{ matrix.workload }} on ${{ matrix.runner }} (run ${{ inputs.repeat }})"
+            echo ""
+            echo "| metric | value |"
+            echo "|---|---:|"
+            echo "| workload wall-clock | ${WORKLOAD_MS} ms |"
+            echo "| detail | ${DETAIL} |"
+            echo "| vCPU | $(nproc) |"
+          } >> "$GITHUB_STEP_SUMMARY"
