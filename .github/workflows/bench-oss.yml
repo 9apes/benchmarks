@@ -68,20 +68,24 @@ jobs:
       # The rest stay at 2 vCPU, where `ubuntu-latest` and the 9apes 2 vCPU
       # label are both 2 cores / 7 GB.
       #
-      # Note that `ubuntu-latest` is 2 vCPU on a private repository and 4 vCPU
-      # on a public one. Should this repo's visibility change, the 2 vCPU rows
-      # stop being size-matched and have to be re-measured; the xls row is
-      # unaffected, since a named larger runner is the same either way.
+      # `ubuntu-latest` is not a fixed size: GitHub gives it 2 vCPU on a private
+      # repository and 4 vCPU on a public one. This repo is public, so it is
+      # 4 vCPU and pairs with the 4 vCPU 9apes label. The earlier figures on
+      # 9apes.com were measured at 2v2 while this repo was private; they cannot
+      # be reproduced here any more, which is why the rows moved to 4v4.
+      #
+      # `ubuntu-8-core` is a named larger runner and stays 8 vCPU either way,
+      # so the xls row is unaffected by visibility.
       matrix:
         include:
           - { project: xls, arm: github, runner: ubuntu-8-core, vcpu: 8 }
           - { project: xls, arm: nineapes, runner: 9apes-8vcpu-ubuntu-2404, vcpu: 8 }
-          - { project: folly, arm: github, runner: ubuntu-latest, vcpu: 2 }
-          - { project: folly, arm: nineapes, runner: 9apes-2vcpu-ubuntu-2404, vcpu: 2 }
-          - { project: peerdb, arm: github, runner: ubuntu-latest, vcpu: 2 }
-          - { project: peerdb, arm: nineapes, runner: 9apes-2vcpu-ubuntu-2404, vcpu: 2 }
-          - { project: duckdb, arm: github, runner: ubuntu-latest, vcpu: 2 }
-          - { project: duckdb, arm: nineapes, runner: 9apes-2vcpu-ubuntu-2404, vcpu: 2 }
+          - { project: folly, arm: github, runner: ubuntu-latest, vcpu: 4 }
+          - { project: folly, arm: nineapes, runner: 9apes-4vcpu-ubuntu-2404, vcpu: 4 }
+          - { project: peerdb, arm: github, runner: ubuntu-latest, vcpu: 4 }
+          - { project: peerdb, arm: nineapes, runner: 9apes-4vcpu-ubuntu-2404, vcpu: 4 }
+          - { project: duckdb, arm: github, runner: ubuntu-latest, vcpu: 4 }
+          - { project: duckdb, arm: nineapes, runner: 9apes-4vcpu-ubuntu-2404, vcpu: 4 }
     defaults:
       run:
         shell: bash
@@ -111,6 +115,25 @@ jobs:
           echo "kernel   : $(uname -r)"
           echo "disk /   : $(df -BG --output=avail / | tail -1)"
           echo "disk /tmp: $(df -BG --output=avail /tmp | tail -1)"
+
+      # A row is only a fair comparison if both of its arms are the same size.
+      # Runner sizes are not guaranteed -- `ubuntu-latest` silently changes with
+      # repository visibility -- so this is checked rather than assumed. Failing
+      # here is far better than publishing a number that measured machine size.
+      - name: Check the machine is the size this row expects
+        run: |
+          set -euo pipefail
+          want='${{ matrix.vcpu }}'
+          got="$(nproc)"
+          if [ "$got" != "$want" ]; then
+            echo "::error::'${{ matrix.runner }}' gave ${got} vCPU, but this row is defined as ${want}."
+            echo "::error::Both arms of a project must match, or the result measures size, not speed."
+            echo "::error::GitHub's ubuntu-latest is 2 vCPU on a private repo and 4 vCPU on a public"
+            echo "::error::one; if this repo's visibility changed, pair it with the 9apes label of"
+            echo "::error::the matching size and update the vcpu field in the matrix."
+            exit 1
+          fi
+          echo "size-matched at ${got} vCPU"
 
       # ---------------- google/xls (Bazel) ----------------
       - name: Checkout xls
