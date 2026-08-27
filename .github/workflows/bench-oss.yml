@@ -7,8 +7,10 @@ name: Bench OSS (GitHub-hosted vs 9apes)
 # something invented for a marketing page. The only difference between the two
 # arms is `runs-on`.
 #
-# Sizes are matched: `ubuntu-latest` is 2 vCPU, compared against the 2 vCPU
-# 9apes label, not the 4 vCPU default.
+# Sizes are matched within each project: both arms of a row are the same size,
+# so the row measures the machine rather than the machine's size. Rows do not
+# all use the same size -- xls runs at 8 vCPU because at 2 it takes over five
+# hours, the rest at 2 vCPU. See the matrix below.
 #
 # Toolchain installation, system packages and code generation each get their own
 # step, outside the timer. Only compilation is measured, and both arms run
@@ -46,15 +48,40 @@ permissions:
 
 jobs:
   bench:
-    name: "${{ matrix.project }} on ${{ matrix.arm }} (run ${{ inputs.repeat }})"
-    runs-on: ${{ matrix.arm == 'github' && 'ubuntu-latest' || '9apes-2vcpu-ubuntu-2404' }}
-    # GitHub caps a job at 360 minutes; xls took ~3h26m on 2 vCPU historically.
+    name: "${{ matrix.project }} on ${{ matrix.arm }} ${{ matrix.vcpu }}v (run ${{ inputs.repeat }})"
+    runs-on: ${{ matrix.runner }}
+    # GitHub caps a job at 360 minutes. xls needs over five hours at 2 vCPU,
+    # which is why it runs at 8.
     timeout-minutes: 350
     strategy:
       fail-fast: false
+      # Every pair is written out rather than crossed, because the runner size
+      # is not the same for every project. What makes a row a fair comparison
+      # is that both arms of that row are the same size -- not that every row
+      # uses the same size as every other.
+      #
+      # xls runs at 8 vCPU on both arms: at 2 vCPU it takes 5h14m, which makes
+      # three repetitions impractical and leaves no headroom under GitHub's
+      # 360-minute job cap. `ubuntu-8-core` is a larger runner created in the
+      # org's Actions settings; its name is its label.
+      #
+      # The rest stay at 2 vCPU, where `ubuntu-latest` and the 9apes 2 vCPU
+      # label are both 2 cores / 7 GB.
+      #
+      # Note that `ubuntu-latest` is 2 vCPU on a private repository and 4 vCPU
+      # on a public one. Should this repo's visibility change, the 2 vCPU rows
+      # stop being size-matched and have to be re-measured; the xls row is
+      # unaffected, since a named larger runner is the same either way.
       matrix:
-        arm: [github, nineapes]
-        project: [xls, folly, peerdb, duckdb]
+        include:
+          - { project: xls, arm: github, runner: ubuntu-8-core, vcpu: 8 }
+          - { project: xls, arm: nineapes, runner: 9apes-8vcpu-ubuntu-2404, vcpu: 8 }
+          - { project: folly, arm: github, runner: ubuntu-latest, vcpu: 2 }
+          - { project: folly, arm: nineapes, runner: 9apes-2vcpu-ubuntu-2404, vcpu: 2 }
+          - { project: peerdb, arm: github, runner: ubuntu-latest, vcpu: 2 }
+          - { project: peerdb, arm: nineapes, runner: 9apes-2vcpu-ubuntu-2404, vcpu: 2 }
+          - { project: duckdb, arm: github, runner: ubuntu-latest, vcpu: 2 }
+          - { project: duckdb, arm: nineapes, runner: 9apes-2vcpu-ubuntu-2404, vcpu: 2 }
     defaults:
       run:
         shell: bash
@@ -75,6 +102,10 @@ jobs:
         run: |
           echo "arm      : ${{ matrix.arm }}"
           echo "project  : ${{ matrix.project }}"
+          echo "runner   : ${{ matrix.runner }}"
+          # The matrix says what size was asked for; nproc says what arrived.
+          # A mismatch means the pair is no longer size-matched.
+          echo "want vcpu: ${{ matrix.vcpu }}"
           echo "nproc    : $(nproc)"
           echo "mem      : $(free -g | awk '/^Mem:/{print $2" GB"}')"
           echo "kernel   : $(uname -r)"
@@ -245,12 +276,13 @@ jobs:
       - name: Emit result
         if: ${{ always() && env.WORKLOAD_MS != '' }}
         run: |
-          echo "OSS_RESULT {\"arm\":\"${{ matrix.arm }}\",\"project\":\"${{ matrix.project }}\",\"repeat\":\"${{ inputs.repeat }}\",\"ms\":${WORKLOAD_MS},\"nproc\":$(nproc)}"
+          echo "OSS_RESULT {\"arm\":\"${{ matrix.arm }}\",\"project\":\"${{ matrix.project }}\",\"repeat\":\"${{ inputs.repeat }}\",\"ms\":${WORKLOAD_MS},\"nproc\":$(nproc),\"runner\":\"${{ matrix.runner }}\"}"
           {
             echo "### ${{ matrix.project }} on ${{ matrix.arm }} (run ${{ inputs.repeat }})"
             echo ""
             echo "| metric | value |"
             echo "|---|---:|"
             echo "| build wall-clock | ${WORKLOAD_MS} ms |"
+            echo "| runner | ${{ matrix.runner }} |"
             echo "| vCPU | $(nproc) |"
           } >> "$GITHUB_STEP_SUMMARY"
